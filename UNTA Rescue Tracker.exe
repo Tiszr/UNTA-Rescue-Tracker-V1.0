@@ -1,0 +1,420 @@
+import requests
+import json
+import re
+import threading
+import time
+from pathlib import Path
+
+import customtkinter as ctk
+
+
+JOURNAL_DIR = Path.home() / "Saved Games" / "Frontier Developments" / "Elite Dangerous"
+
+WEBHOOK_URL = "WEBHOOK_URL"
+SECRET_KEY = "SECRET_KEY"
+
+tracking = False
+session_total = 0
+mission_count = 0
+cmdr_name = "Unknown"
+
+
+def send_to_sheet(event, passengers, cmdr_name):
+    payload = {
+        "secret": SECRET_KEY,
+        "timestamp": event.get("timestamp", ""),
+        "cmdr": cmdr_name,
+        "passengers": passengers,
+        "reward": event.get("Reward", 0),
+        "destinationStation": event.get("DestinationStation", ""),
+        "destinationSystem": event.get("DestinationSystem", ""),
+        "missionId": event.get("MissionID", "")
+    }
+
+    response = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+    return response.text
+
+
+def latest_journal():
+    journals = sorted(JOURNAL_DIR.glob("Journal*.log"), key=lambda p: p.stat().st_mtime)
+    if not journals:
+        return None
+    return journals[-1]
+
+
+def get_last_cmdr_name(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8") as file:
+            for line in file:
+                try:
+                    event = json.loads(line)
+                    if event.get("event") == "LoadGame":
+                        return event.get("Commander", "Unknown")
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return "Unknown"
+
+
+def get_passenger_count(event):
+    name = event.get("LocalisedName", "")
+    match = re.search(r"\b(\d+)\b", name)
+    return int(match.group(1)) if match else 0
+
+
+def is_rescue_passenger_mission(event):
+    if event.get("event") != "MissionCompleted":
+        return False
+
+    name = str(event.get("Name", "")).lower()
+    localised_name = str(event.get("LocalisedName", "")).lower()
+
+    return (
+        "evacuation" in name
+        or "seeking evacuation" in localised_name
+        or "evacuation" in localised_name
+    )
+
+
+class UNTARescueTracker(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        #self.dev_button = ctk.CTkButton(
+        #    self,
+        #    text="•",
+        #    width=24,
+        #    height=24,
+        #    fg_color="#0b111c",
+        #    hover_color="#1f2937",
+        #    text_color="#6b7280",
+        #    corner_radius=6,
+        #    command=self.dev_test_upload
+        #)
+        #self.dev_button.place(x=6, y=6)
+
+        self.title("UNTA Rescue Tracker")
+        self.geometry("620x680")
+        self.resizable(False, False)
+
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+
+        self.configure(fg_color="#0b111c")
+
+        self.journal_file = latest_journal()
+
+        # Header
+        self.header_frame = ctk.CTkFrame(self, fg_color="#111827", corner_radius=18)
+        self.header_frame.pack(padx=24, pady=(24, 14), fill="x")
+
+        self.title_label = ctk.CTkLabel(
+            self.header_frame,
+            text="UNTA RESCUE TRACKER",
+            font=("Segoe UI", 30, "bold"),
+            text_color="#e5e7eb"
+        )
+        self.title_label.pack(pady=(22, 4))
+
+        self.subtitle = ctk.CTkLabel(
+            self.header_frame,
+            text="Burning Starport Evacuation Operations",
+            font=("Segoe UI", 14),
+            text_color="#9ca3af"
+        )
+        self.subtitle.pack(pady=(0, 18))
+
+        # Status row
+        self.status_frame = ctk.CTkFrame(self, fg_color="#0f172a", corner_radius=16)
+        self.status_frame.pack(padx=24, pady=8, fill="x")
+
+        self.status_label = ctk.CTkLabel(
+            self.status_frame,
+            text="● Tracking automatically",
+            font=("Segoe UI", 16, "bold"),
+            text_color="#22c55e"
+        )
+        self.status_label.pack(side="left", padx=20, pady=16)
+
+        self.upload_status_label = ctk.CTkLabel(
+            self.status_frame,
+            text="UNTA Network: Ready",
+            font=("Segoe UI", 14),
+            text_color="#38bdf8"
+        )
+        self.upload_status_label.pack(side="right", padx=20, pady=16)
+
+        # CMDR card
+        self.cmdr_card = ctk.CTkFrame(self, fg_color="#111827", corner_radius=18)
+        self.cmdr_card.pack(padx=24, pady=10, fill="x")
+
+        self.cmdr_title = ctk.CTkLabel(
+            self.cmdr_card,
+            text="ACTIVE COMMANDER",
+            font=("Segoe UI", 12, "bold"),
+            text_color="#6b7280"
+        )
+        self.cmdr_title.pack(pady=(18, 2))
+
+        self.cmdr_label = ctk.CTkLabel(
+            self.cmdr_card,
+            text="CMDR: Unknown",
+            font=("Segoe UI", 24, "bold"),
+            text_color="#f9fafb"
+        )
+        self.cmdr_label.pack(pady=(0, 18))
+
+        # Stats cards
+        self.stats_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.stats_frame.pack(padx=24, pady=8, fill="x")
+
+        self.rescue_card = ctk.CTkFrame(self.stats_frame, fg_color="#132033", corner_radius=18)
+        self.rescue_card.pack(side="left", expand=True, fill="both", padx=(0, 8))
+
+        self.rescue_number = ctk.CTkLabel(
+            self.rescue_card,
+            text="0",
+            font=("Segoe UI", 42, "bold"),
+            text_color="#38bdf8"
+        )
+        self.rescue_number.pack(pady=(22, 0))
+
+        self.rescue_label = ctk.CTkLabel(
+            self.rescue_card,
+            text="People Rescued",
+            font=("Segoe UI", 14),
+            text_color="#cbd5e1"
+        )
+        self.rescue_label.pack(pady=(0, 22))
+
+        self.mission_card = ctk.CTkFrame(self.stats_frame, fg_color="#132033", corner_radius=18)
+        self.mission_card.pack(side="right", expand=True, fill="both", padx=(8, 0))
+
+        self.mission_number = ctk.CTkLabel(
+            self.mission_card,
+            text="0",
+            font=("Segoe UI", 42, "bold"),
+            text_color="#a78bfa"
+        )
+        self.mission_number.pack(pady=(22, 0))
+
+        self.mission_label = ctk.CTkLabel(
+            self.mission_card,
+            text="Missions Completed",
+            font=("Segoe UI", 14),
+            text_color="#cbd5e1"
+        )
+        self.mission_label.pack(pady=(0, 22))
+
+        # Last rescue
+        self.last_card = ctk.CTkFrame(self, fg_color="#111827", corner_radius=18)
+        self.last_card.pack(padx=24, pady=10, fill="x")
+
+        self.last_title = ctk.CTkLabel(
+            self.last_card,
+            text="LAST RESCUE",
+            font=("Segoe UI", 12, "bold"),
+            text_color="#6b7280"
+        )
+        self.last_title.pack(pady=(16, 2))
+
+        self.last_rescue_label = ctk.CTkLabel(
+            self.last_card,
+            text="No rescue logged yet",
+            font=("Segoe UI", 15),
+            text_color="#e5e7eb",
+            wraplength=520
+        )
+        self.last_rescue_label.pack(pady=(0, 18))
+
+        # Log
+        self.log_title = ctk.CTkLabel(
+            self,
+            text="SYSTEM LOG",
+            font=("Segoe UI", 12, "bold"),
+            text_color="#6b7280"
+        )
+        self.log_title.pack(padx=30, pady=(10, 2), anchor="w")
+
+        self.log_box = ctk.CTkTextbox(
+            self,
+            width=570,
+            height=140,
+            fg_color="#020617",
+            text_color="#d1d5db",
+            corner_radius=14,
+            font=("Consolas", 12)
+        )
+        self.log_box.pack(padx=24, pady=(0, 18))
+
+        self.log("UNTA Rescue Tracker initialised.")
+
+        if self.journal_file:
+            detected_cmdr = get_last_cmdr_name(self.journal_file)
+            self.cmdr_label.configure(text=f"CMDR: {detected_cmdr}")
+            self.log(f"Found journal: {self.journal_file.name}")
+        else:
+            self.log("No Elite Dangerous journal found yet.")
+
+        self.start_auto_tracking()
+
+    def dev_test_upload(self):
+        global session_total, mission_count, cmdr_name
+
+        fake_event = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": "MissionCompleted",
+            "Name": "Mission_PassengerBulk_Evacuation_name",
+            "LocalisedName": "180 Tourists Seeking Evacuation",
+            "MissionID": int(time.time()),
+            "DestinationSystem": "Dev System",
+            "DestinationStation": "Dev Station",
+            "Reward": 1234567
+        }
+
+        passengers = get_passenger_count(fake_event)
+        station = fake_event["DestinationStation"]
+        system = fake_event["DestinationSystem"]
+
+        if cmdr_name == "Unknown" and self.journal_file:
+            cmdr_name = get_last_cmdr_name(self.journal_file)
+
+        session_total += passengers
+        mission_count += 1
+
+        self.rescue_number.configure(text=f"{session_total:,}")
+        self.mission_number.configure(text=f"{mission_count:,}")
+        self.last_rescue_label.configure(
+            text=f"{passengers:,} passengers evacuated to {station}, {system}"
+        )
+
+        self.log(f"[DEV] {passengers} passengers → {station}")
+
+        try:
+            upload_result = send_to_sheet(fake_event, passengers, cmdr_name)
+
+            if upload_result == "OK":
+                self.upload_status_label.configure(
+                    text="UNTA Network: Connected ✅",
+                    text_color="#22c55e"
+                )
+                self.log("Dev upload successful.")
+            else:
+                self.upload_status_label.configure(
+                    text="UNTA Network: Upload issue",
+                    text_color="#f97316"
+                )
+                self.log(f"Dev upload issue: {upload_result}")
+
+        except Exception as e:
+            self.upload_status_label.configure(
+                text="UNTA Network: Error ❌",
+                text_color="#ef4444"
+            )
+            self.log(f"Dev upload failed: {e}")
+            
+    def log(self, message):
+        timestamp = time.strftime("%H:%M:%S")
+        self.log_box.insert("end", f"[{timestamp}] {message}\n")
+        self.log_box.see("end")
+
+    def start_auto_tracking(self):
+        global tracking
+
+        tracking = True
+        self.status_label.configure(text="● Tracking automatically", text_color="#22c55e")
+
+        thread = threading.Thread(target=self.watch_journals_auto, daemon=True)
+        thread.start()
+
+        self.log("Auto tracking started.")
+
+    def watch_journals_auto(self):
+        global session_total, mission_count, cmdr_name
+
+        current_file = None
+        file_handle = None
+
+        while tracking:
+            latest_file = latest_journal()
+
+            if not latest_file:
+                self.status_label.configure(text="● No journal found", text_color="#ef4444")
+                time.sleep(2)
+                continue
+
+            if latest_file != current_file:
+                if file_handle:
+                    file_handle.close()
+
+                current_file = latest_file
+                self.journal_file = latest_file
+
+                cmdr_name = get_last_cmdr_name(current_file)
+                self.cmdr_label.configure(text=f"CMDR: {cmdr_name}")
+                self.status_label.configure(text="● Tracking automatically", text_color="#22c55e")
+                self.log(f"Now watching: {current_file.name}")
+
+                file_handle = open(current_file, "r", encoding="utf-8")
+                file_handle.seek(0, 2)
+
+            line = file_handle.readline()
+
+            if not line:
+                time.sleep(0.2)
+                continue
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if event.get("event") == "LoadGame":
+                cmdr_name = event.get("Commander", cmdr_name)
+                self.cmdr_label.configure(text=f"CMDR: {cmdr_name}")
+
+            if is_rescue_passenger_mission(event):
+                passengers = get_passenger_count(event)
+                station = event.get("DestinationStation", "Unknown station")
+                system = event.get("DestinationSystem", "Unknown system")
+
+                session_total += passengers
+                mission_count += 1
+
+                self.rescue_number.configure(text=f"{session_total:,}")
+                self.mission_number.configure(text=f"{mission_count:,}")
+                self.last_rescue_label.configure(
+                    text=f"{passengers:,} passengers evacuated to {station}, {system}"
+                )
+
+                self.log(f"Rescue complete: {passengers:,} passengers → {station}")
+
+                try:
+                    upload_result = send_to_sheet(event, passengers, cmdr_name)
+
+                    if upload_result == "OK":
+                        self.upload_status_label.configure(
+                            text="UNTA Network: Connected ✅",
+                            text_color="#22c55e"
+                        )
+                        self.log("Uploaded to UNTA Sheet.")
+                    else:
+                        self.upload_status_label.configure(
+                            text="UNTA Network: Upload issue",
+                            text_color="#f97316"
+                        )
+                        self.log(f"Upload issue: {upload_result}")
+
+                except Exception as e:
+                    self.upload_status_label.configure(
+                        text="UNTA Network: Error ❌",
+                        text_color="#ef4444"
+                    )
+                    self.log(f"Upload failed: {e}")
+
+
+if __name__ == "__main__":
+    app = UNTARescueTracker()
+    app.mainloop()
